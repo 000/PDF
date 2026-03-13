@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 from dataclasses import dataclass, asdict
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+import fitz
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageStat
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 
@@ -21,6 +23,15 @@ EXCLUDED_TOP_LEVEL_DIRS = {"output", ".venv", ".git", "__pycache__", "scripts"}
 FONT_REGULAR = Path("/System/Library/Fonts/Supplemental/Tahoma.ttf")
 FONT_BOLD = Path("/System/Library/Fonts/Supplemental/Tahoma Bold.ttf")
 WATERMARK_IMAGE_NAME = "watermark_recreated.png"
+PREFERRED_WATERMARKS = (
+    "watermarking_truecopy_March10th_transparent copy.png",
+    WATERMARK_IMAGE_NAME,
+)
+
+ANALYSIS_RENDER_SCALE = 1.35
+OCCUPANCY_THRESHOLD = 22
+CLEAR_REGION_THRESHOLD = 0.003
+ADAPTIVE_SCALE_FACTORS = (1.0, 0.92, 0.84)
 
 DESCRIPTIONS_TH = {
     "NCSA_Submission_Cert/CCSKv5.pdf": (
@@ -92,6 +103,16 @@ class PdfRecord:
     output_relative_path: str
 
 
+@dataclass(frozen=True)
+class Placement:
+    x_pt: float
+    y_pt: float
+    width_pt: float
+    height_pt: float
+    occupancy_ratio: float
+    moved: bool
+
+
 def ensure_dirs() -> None:
     for path in (OUTPUT_DIR, WATERMARKED_ROOT, CATALOG_DIR, ASSET_DIR):
         path.mkdir(parents=True, exist_ok=True)
@@ -99,16 +120,12 @@ def ensure_dirs() -> None:
 
 def iter_source_pdfs() -> list[Path]:
     pdfs: list[Path] = []
-    for path in ROOT.rglob("*.pdf"):
-        rel = path.relative_to(ROOT)
-        if rel.parts and rel.parts[0] in EXCLUDED_TOP_LEVEL_DIRS:
-            continue
-        pdfs.append(path)
-    for path in ROOT.rglob("*.PDF"):
-        rel = path.relative_to(ROOT)
-        if rel.parts and rel.parts[0] in EXCLUDED_TOP_LEVEL_DIRS:
-            continue
-        pdfs.append(path)
+    for pattern in ("*.pdf", "*.PDF"):
+        for path in ROOT.rglob(pattern):
+            rel = path.relative_to(ROOT)
+            if rel.parts and rel.parts[0] in EXCLUDED_TOP_LEVEL_DIRS:
+                continue
+            pdfs.append(path)
     return sorted(set(pdfs))
 
 
@@ -204,57 +221,217 @@ def create_watermark_image(path: Path) -> tuple[int, int]:
     return size
 
 
-def make_overlay_pdf(page_width: float, page_height: float, watermark_path: Path, watermark_size: tuple[int, int]) -> bytes:
-    wm_width, wm_height = watermark_size
-    aspect_ratio = wm_width / wm_height
+def resolve_watermark_asset(explicit_path: Path | None) -> tuple[Path, tuple[int, int]]:
+    candidates: list[Path] = []
+    if explicit_path is not None:
+        candidates.append(explicit_path if explicit_path.is_absolute() else ROOT / explicit_path)
+    candidates.extend(ASSET_DIR / name for name in PREFERRED_WATERMARKS)
 
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            with Image.open(candidate) as watermark:
+                return candidate, watermark.size
+
+    fallback = ASSET_DIR / WATERMARK_IMAGE_NAME
+    return fallback, create_watermark_image(fallback)
+
+
+def get_base_watermark_width(page_width: float, page_height: float) -> float:
     target_width = max(150.0, min(page_width * 0.28, 220.0))
     if page_width > page_height:
         target_width = max(170.0, min(page_width * 0.24, 235.0))
-    target_height = target_width / aspect_ratio
-    margin = max(12.0, min(page_width, page_height) * 0.02)
-    x = page_width - target_width - margin
-    y = page_height - target_height - margin
+    return target_width
 
+
+def render_analysis_image(page: fitz.Page) -> Image.Image:
+    pixmap = page.get_pixmap(matrix=fitz.Matrix(ANALYSIS_RENDER_SCALE, ANALYSIS_RENDER_SCALE), alpha=False)
+    mode = "RGB" if pixmap.n < 4 else "RGBA"
+    return Image.frombytes(mode, (pixmap.width, pixmap.height), pixmap.samples).convert("RGB")
+
+
+def build_content_mask(page_image: Image.Image) -> Image.Image:
+    white_bg = Image.new("RGB", page_image.size, (255, 255, 255))
+    diff = ImageChops.difference(page_image, white_bg).convert("L")
+    mask = diff.point(lambda value: 255 if value >= OCCUPANCY_THRESHOLD else 0)
+    return mask.filter(ImageFilter.MaxFilter(5))
+
+
+def iter_candidate_offsets(max_left_px: int, max_down_px: int, step_x: int, step_y: int) -> list[tuple[int, int]]:
+    offsets: list[tuple[int, int]] = []
+    for dy in range(0, max_down_px + 1, step_y):
+        for dx in range(0, max_left_px + 1, step_x):
+            offsets.append((dx, dy))
+    offsets.sort(key=lambda pair: (pair[0] + pair[1], pair[1], pair[0]))
+    return offsets
+
+
+def compute_occupancy(mask: Image.Image, x_px: int, y_px: int, width_px: int, height_px: int) -> float:
+    pad = max(4, round(min(width_px, height_px) * 0.05))
+    left = max(0, x_px - pad)
+    top = max(0, y_px - pad)
+    right = min(mask.width, x_px + width_px + pad)
+    bottom = min(mask.height, y_px + height_px + pad)
+    region = mask.crop((left, top, right, bottom))
+    area = max(1, region.width * region.height)
+    ink_pixels = ImageStat.Stat(region).sum[0] / 255.0
+    return ink_pixels / area
+
+
+def default_placement(page_width: float, page_height: float, watermark_size: tuple[int, int]) -> Placement:
+    wm_width, wm_height = watermark_size
+    aspect_ratio = wm_width / wm_height
+    width_pt = get_base_watermark_width(page_width, page_height)
+    height_pt = width_pt / aspect_ratio
+    margin_pt = max(12.0, min(page_width, page_height) * 0.02)
+    x_pt = page_width - width_pt - margin_pt
+    y_pt = page_height - height_pt - margin_pt
+    return Placement(x_pt=x_pt, y_pt=y_pt, width_pt=width_pt, height_pt=height_pt, occupancy_ratio=1.0, moved=False)
+
+
+def choose_watermark_placement(
+    page_width: float,
+    page_height: float,
+    watermark_size: tuple[int, int],
+    page_image: Image.Image,
+) -> Placement:
+    wm_width, wm_height = watermark_size
+    aspect_ratio = wm_width / wm_height
+    base_width_pt = get_base_watermark_width(page_width, page_height)
+    margin_pt = max(12.0, min(page_width, page_height) * 0.02)
+    mask = build_content_mask(page_image)
+    x_scale = mask.width / page_width
+    y_scale = mask.height / page_height
+
+    best: Placement | None = None
+    best_score: float | None = None
+
+    for scale_factor in ADAPTIVE_SCALE_FACTORS:
+        width_pt = base_width_pt * scale_factor
+        height_pt = width_pt / aspect_ratio
+        width_px = max(8, round(width_pt * x_scale))
+        height_px = max(8, round(height_pt * y_scale))
+        margin_x_px = max(4, round(margin_pt * x_scale))
+        margin_y_px = max(4, round(margin_pt * y_scale))
+        max_left_px = max(0, round(min(page_width * 0.32, width_pt * 1.8 + 28.0) * x_scale))
+        max_down_px = max(0, round(min(page_height * 0.34, height_pt * 1.9 + 40.0) * y_scale))
+        step_x = max(8, width_px // 10)
+        step_y = max(8, height_px // 10)
+
+        for dx_px, dy_px in iter_candidate_offsets(max_left_px, max_down_px, step_x, step_y):
+            x_px = mask.width - width_px - margin_x_px - dx_px
+            y_px = margin_y_px + dy_px
+            if x_px < margin_x_px:
+                continue
+            if y_px + height_px > mask.height - margin_y_px:
+                continue
+
+            occupancy_ratio = compute_occupancy(mask, x_px, y_px, width_px, height_px)
+            x_pt = x_px / x_scale
+            y_top_pt = y_px / y_scale
+            y_pt = page_height - y_top_pt - height_pt
+            moved = dx_px > 0 or dy_px > 0 or scale_factor < 1.0
+            placement = Placement(
+                x_pt=x_pt,
+                y_pt=y_pt,
+                width_pt=width_pt,
+                height_pt=height_pt,
+                occupancy_ratio=occupancy_ratio,
+                moved=moved,
+            )
+
+            if occupancy_ratio <= CLEAR_REGION_THRESHOLD:
+                return placement
+
+            distance_score = (dx_px / max(1, max_left_px + step_x)) + (dy_px / max(1, max_down_px + step_y))
+            size_penalty = (1.0 - scale_factor) * 0.35
+            score = occupancy_ratio * 1000.0 + distance_score + size_penalty
+            if best_score is None or score < best_score:
+                best = placement
+                best_score = score
+
+    return best or default_placement(page_width, page_height, watermark_size)
+
+
+def make_overlay_pdf(
+    page_width: float,
+    page_height: float,
+    watermark_path: Path,
+    placement: Placement,
+) -> bytes:
     packet = BytesIO()
     pdf = canvas.Canvas(packet, pagesize=(page_width, page_height))
-    pdf.drawImage(str(watermark_path), x, y, width=target_width, height=target_height, mask="auto")
+    pdf.drawImage(
+        str(watermark_path),
+        placement.x_pt,
+        placement.y_pt,
+        width=placement.width_pt,
+        height=placement.height_pt,
+        mask="auto",
+    )
     pdf.save()
     return packet.getvalue()
 
 
-def watermark_pdf(source_pdf: Path, output_pdf: Path, watermark_path: Path, watermark_size: tuple[int, int]) -> int:
+def open_fitz_document(path: Path) -> fitz.Document:
+    document = fitz.open(path)
+    if document.needs_pass and not document.authenticate(""):
+        raise ValueError(f"Unable to open encrypted PDF without a password: {path}")
+    return document
+
+
+def watermark_pdf(source_pdf: Path, output_pdf: Path, watermark_path: Path, watermark_size: tuple[int, int]) -> tuple[int, int]:
     reader = PdfReader(str(source_pdf))
     if reader.is_encrypted:
         reader.decrypt("")
 
     writer = PdfWriter()
     if reader.metadata:
-        writer.add_metadata({k: str(v) for k, v in reader.metadata.items() if v is not None})
+        writer.add_metadata({key: str(value) for key, value in reader.metadata.items() if value is not None})
 
-    overlay_cache: dict[tuple[float, float], bytes] = {}
-    for page in reader.pages:
-        rotation = int(page.get("/Rotate", 0) or 0)
-        if rotation:
-            page.transfer_rotation_to_content()
+    adjusted_pages = 0
+    overlay_cache: dict[tuple[float, float, float, float, float, float], bytes] = {}
 
-        width = float(page.mediabox.width)
-        height = float(page.mediabox.height)
-        key = (round(width, 2), round(height, 2))
-        overlay_bytes = overlay_cache.get(key)
-        if overlay_bytes is None:
-            overlay_bytes = make_overlay_pdf(width, height, watermark_path, watermark_size)
-            overlay_cache[key] = overlay_bytes
+    with open_fitz_document(source_pdf) as rendered_doc:
+        for index, page in enumerate(reader.pages):
+            rotation = int(page.get("/Rotate", 0) or 0)
+            if rotation:
+                page.transfer_rotation_to_content()
 
-        overlay_page = PdfReader(BytesIO(overlay_bytes)).pages[0]
-        page.merge_page(overlay_page, over=True)
-        writer.add_page(page)
+            width = float(page.mediabox.width)
+            height = float(page.mediabox.height)
+            placement = default_placement(width, height, watermark_size)
+
+            try:
+                analysis_image = render_analysis_image(rendered_doc[index])
+                placement = choose_watermark_placement(width, height, watermark_size, analysis_image)
+            except Exception:
+                placement = default_placement(width, height, watermark_size)
+
+            if placement.moved:
+                adjusted_pages += 1
+
+            cache_key = (
+                round(width, 2),
+                round(height, 2),
+                round(placement.x_pt, 2),
+                round(placement.y_pt, 2),
+                round(placement.width_pt, 2),
+                round(placement.height_pt, 2),
+            )
+            overlay_bytes = overlay_cache.get(cache_key)
+            if overlay_bytes is None:
+                overlay_bytes = make_overlay_pdf(width, height, watermark_path, placement)
+                overlay_cache[cache_key] = overlay_bytes
+
+            overlay_page = PdfReader(BytesIO(overlay_bytes)).pages[0]
+            page.merge_page(overlay_page, over=True)
+            writer.add_page(page)
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
     with output_pdf.open("wb") as handle:
         writer.write(handle)
 
-    return len(reader.pages)
+    return len(reader.pages), adjusted_pages
 
 
 def build_inventory(records: list[PdfRecord]) -> None:
@@ -307,31 +484,61 @@ def build_inventory(records: list[PdfRecord]) -> None:
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Watermark repository PDFs into a mirrored output tree.")
+    parser.add_argument(
+        "--watermark",
+        type=Path,
+        help="Optional explicit watermark image path. Defaults to preferred files in output/assets.",
+    )
+    parser.add_argument(
+        "--rebuild-inventory",
+        action="store_true",
+        help="Rebuild the catalog files after watermarking.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     ensure_dirs()
-    watermark_path = ASSET_DIR / WATERMARK_IMAGE_NAME
-    watermark_size = create_watermark_image(watermark_path)
+    watermark_path, watermark_size = resolve_watermark_asset(args.watermark)
 
     records: list[PdfRecord] = []
-    for source_pdf in iter_source_pdfs():
+    total_pages = 0
+    adjusted_pages = 0
+    source_pdfs = iter_source_pdfs()
+
+    for source_pdf in source_pdfs:
         relative_path = source_pdf.relative_to(ROOT).as_posix()
         output_pdf = WATERMARKED_ROOT / relative_path
-        pages = watermark_pdf(source_pdf, output_pdf, watermark_path, watermark_size)
-        record = PdfRecord(
-            relative_path=relative_path,
-            filename=source_pdf.name,
-            pages=pages,
-            file_size_bytes=source_pdf.stat().st_size,
-            description_th=DESCRIPTIONS_TH.get(relative_path, "ไม่พบคำอธิบายสำหรับไฟล์นี้"),
-            output_relative_path=output_pdf.relative_to(OUTPUT_DIR).as_posix(),
-        )
-        records.append(record)
+        pages, adjusted = watermark_pdf(source_pdf, output_pdf, watermark_path, watermark_size)
+        total_pages += pages
+        adjusted_pages += adjusted
 
-    build_inventory(records)
-    print(f"Processed {len(records)} PDF files.")
+        if args.rebuild_inventory:
+            records.append(
+                PdfRecord(
+                    relative_path=relative_path,
+                    filename=source_pdf.name,
+                    pages=pages,
+                    file_size_bytes=source_pdf.stat().st_size,
+                    description_th=DESCRIPTIONS_TH.get(relative_path, "ไม่พบคำอธิบายสำหรับไฟล์นี้"),
+                    output_relative_path=output_pdf.relative_to(OUTPUT_DIR).as_posix(),
+                )
+            )
+
+    if args.rebuild_inventory:
+        build_inventory(records)
+
+    print(f"Processed {len(source_pdfs)} PDF files and {total_pages} pages.")
+    print(f"Adaptive placement adjusted {adjusted_pages} pages away from the default top-right anchor.")
     print(f"Watermarked PDFs: {WATERMARKED_ROOT}")
-    print(f"Catalog files: {CATALOG_DIR}")
-    print(f"Watermark asset: {watermark_path}")
+    print(f"Watermark asset used: {watermark_path}")
+    if args.rebuild_inventory:
+        print(f"Catalog files: {CATALOG_DIR}")
+    else:
+        print("Catalog files were left unchanged.")
 
 
 if __name__ == "__main__":
